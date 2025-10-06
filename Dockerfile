@@ -30,6 +30,8 @@ FROM alpine:latest
 # Install only runtime vips library from edge
 RUN apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
     vips \
+    libheif \
+    imagemagick \
     ca-certificates
 
 WORKDIR /app
