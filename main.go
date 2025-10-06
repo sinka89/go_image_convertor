@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"image"
 	_ "image/png"
@@ -19,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,9 +28,13 @@ import (
 )
 
 const (
-	DefaultMaxUploadBytes = 20 << 20
-	DefaultTimeoutSec     = 30
-	DefaultConcurrency    = 10
+	DefaultMaxUploadBytes           = 10 << 20
+	DefaultTimeoutSec               = 30
+	DefaultConcurrencyImgProcessing = 10
+	DefaultMaxHeaderBytes           = 1 << 20
+	DefaultMaxCacheFiles            = 200
+	DefaultMaxCacheMem              = 50 * 1024 * 1024
+	DefaultMaxCacheSize             = 200
 )
 
 type TargetConversion string
@@ -44,10 +48,18 @@ const (
 )
 
 var (
-	addr          = flag.String("addr", ":8080", "http service address")
-	maxUploadFlag = flag.Int("max-upload-bytes", DefaultMaxUploadBytes, "maximum upload size in bytes")
-	timeoutFlag   = flag.Int("timeout-seconds", DefaultTimeoutSec, "timeout in seconds")
-	maxWorkers    = flag.Int("max-workers", 0, "maximum number of workers (0 -> 2 * GOMAXPROCS)") // basically threads
+	addr                     string
+	maxUploadFlag            int
+	maxHeaderBytes           int
+	readTimeout              int
+	writeTimeout             int
+	idleTimeout              int
+	maxWorkers               int
+	imgProcessingConcurrency int
+	maxCacheFiles            int
+	maxCacheMem              int
+	maxCacheSize             int
+	vectorEnabled            bool
 )
 
 var sem chan struct{}
@@ -65,34 +77,35 @@ type Options struct {
 }
 
 func main() {
-
-	flag.Parse()
+	parseEnvVariables()
 	conf := vips.Config{
-		MaxCacheFiles:    200,
-		MaxCacheMem:      50 * 1024 * 1024,
-		MaxCacheSize:     200,
-		ConcurrencyLevel: DefaultConcurrency,
+		MaxCacheFiles:    maxCacheFiles,
+		MaxCacheMem:      maxCacheMem,
+		MaxCacheSize:     maxCacheSize,
+		ConcurrencyLevel: imgProcessingConcurrency,
+		VectorEnabled:    vectorEnabled,
 	}
+
 	vips.Startup(&conf)
 	defer vips.Shutdown()
 
-	if *maxWorkers <= 0 {
-		*maxWorkers = runtime.GOMAXPROCS(0) * 2
+	if maxWorkers <= 0 {
+		maxWorkers = runtime.GOMAXPROCS(0) * 2
 	}
 
-	sem = make(chan struct{}, *maxWorkers)
+	sem = make(chan struct{}, maxWorkers)
 
 	mux := &http.ServeMux{}
 	mux.HandleFunc("/convert", withPanicLogic(convertHandler))
 
 	srv := &http.Server{
-		Addr:              *addr,
+		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       time.Duration(*timeoutFlag) * time.Second,
-		WriteTimeout:      time.Duration(*timeoutFlag*2) * time.Second,
-		IdleTimeout:       time.Duration(*timeoutFlag*2) * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		ReadTimeout:       time.Duration(readTimeout) * time.Second,
+		WriteTimeout:      time.Duration(writeTimeout) * time.Second,
+		IdleTimeout:       time.Duration(idleTimeout) * time.Second,
+		MaxHeaderBytes:    maxUploadFlag,
 	}
 
 	// graceful shutdown
@@ -112,7 +125,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen failed: %v", err)
 	}
-	log.Printf("listening on %s, maxWorkers=%d", srv.Addr, *maxWorkers)
+	log.Printf("listening on %s, maxWorkers=%d", srv.Addr, maxWorkers)
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server failed: %v", err)
@@ -139,7 +152,7 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maxUpload := *maxUploadFlag
+	maxUpload := maxUploadFlag
 	r.Body = http.MaxBytesReader(w, r.Body, int64(maxUpload))
 
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
@@ -187,7 +200,7 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(*timeoutFlag)*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(readTimeout)*time.Second)
 	defer cancel()
 
 	select {
@@ -412,4 +425,82 @@ func guessExtensionFromMime(m string) string {
 	default:
 		return ""
 	}
+}
+
+func parseEnvVariables() {
+	serverListeningPort := os.Getenv("ListeningPort")
+	if serverListeningPort != "" {
+		addr = ":" + serverListeningPort
+	} else {
+		addr = ":8080"
+	}
+	maxUpFlag := os.Getenv("MaxUploadBytes")
+	if maxUpFlag != "" {
+		maxUploadFlag, _ = strconv.Atoi(maxUpFlag)
+	} else {
+		maxUploadFlag = DefaultMaxUploadBytes
+	}
+	timeout := os.Getenv("ReadTimeoutSec")
+	if timeout != "" {
+		readTimeout, _ = strconv.Atoi(timeout)
+	} else {
+		readTimeout = DefaultTimeoutSec
+	}
+	wTimeout := os.Getenv("WriteTimeoutSec")
+	if wTimeout != "" {
+		writeTimeout, _ = strconv.Atoi(wTimeout)
+	} else {
+		writeTimeout = readTimeout * 2
+	}
+	iTimeout := os.Getenv("IdleTimeoutSec")
+	if iTimeout != "" {
+		idleTimeout, _ = strconv.Atoi(iTimeout)
+	} else {
+		idleTimeout = readTimeout * 2
+	}
+	serWorkers := os.Getenv("MaxWorkers")
+	if serWorkers != "" {
+		maxWorkers, _ = strconv.Atoi(serWorkers)
+	} else {
+		maxWorkers = 0
+	}
+	hBytes := os.Getenv("MaxHeaderBytes")
+	if hBytes != "" {
+		maxHeaderBytes, _ = strconv.Atoi(hBytes)
+	} else {
+		maxHeaderBytes = DefaultMaxHeaderBytes
+	}
+	imgProcessingCon := os.Getenv("VipsImageProcessingConcurrency")
+	if imgProcessingCon != "" {
+		imgProcessingConcurrency, _ = strconv.Atoi(imgProcessingCon)
+	} else {
+		imgProcessingConcurrency = DefaultConcurrencyImgProcessing
+	}
+	mCacheFiles := os.Getenv("VipsMaxCacheFiles")
+	if mCacheFiles != "" {
+		maxCacheFiles, _ = strconv.Atoi(mCacheFiles)
+	} else {
+		maxCacheFiles = DefaultMaxCacheFiles
+	}
+	mCacheMem := os.Getenv("VipsMaxCacheMem")
+	if mCacheMem != "" {
+		maxCacheMem, _ = strconv.Atoi(mCacheMem)
+	} else {
+		maxCacheMem = DefaultMaxCacheMem
+	}
+	mCacheSize := os.Getenv("VipsMaxCacheSize")
+	if mCacheSize != "" {
+		maxCacheSize, _ = strconv.Atoi(mCacheSize)
+	} else {
+		maxCacheSize = DefaultMaxCacheSize
+	}
+	vectorEnabledStr := os.Getenv("VipsVectorEnabled")
+	if vectorEnabledStr != "" {
+		vectorEnabled, _ = strconv.ParseBool(vectorEnabledStr)
+	} else {
+		vectorEnabled = false
+	}
+
+	log.Printf("Configuration: listeningAddress: %s | maxUpload: %d | maxHeaderBytes: %d | readTimeout: %d | writeTimeout: %d | idleTimeout: %d | serverWorkers: %d | vipsImgProcessingConcurrency: %d | vipsMaxCacheFiles: %d | vipsMaxCacheMem: %d | vipsMaxCacheSize: %d | vipsVectorEnabled: %v",
+		addr, maxUploadFlag, maxHeaderBytes, readTimeout, writeTimeout, idleTimeout, maxWorkers, imgProcessingConcurrency, maxCacheFiles, maxCacheMem, maxCacheSize, vectorEnabled)
 }
